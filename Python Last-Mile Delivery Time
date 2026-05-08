@@ -1,0 +1,329 @@
+"""
+=============================================================================
+  LAST-MILE DELIVERY TIME UNCERTAINTY SIMULATION
+  Discrete-Event Queue Simulation with Monte Carlo Methods
+  Couriers: J&T Express, Shopee Express, LBC, Ninja Van
+
+  FIXES APPLIED:
+  ─────────────────────────────────────────────────────────────────────────
+  1. Removed hardcoded /mnt/user-data/outputs/ save path → saves to
+     current working directory as "last_mile_delivery_histograms.png"
+  2. Added try/except around savefig for safer error handling
+  3. Added ax6 ylim re-fetch AFTER plotting so text doesn't clip at y=0
+  4. Fixed ax6 time-slot label y-position (was drawn before ylim was set)
+  5. Added explicit figure DPI and tight layout call before savefig
+=============================================================================
+
+DISTRIBUTIONS USED & WHY:
+─────────────────────────────────────────────────────────────────────────────
+1. EXPONENTIAL   → Inter-arrival times between rider deliveries on a route.
+                   Memoryless property fits the unpredictable gaps between
+                   stops; each stop arrival is independent of the last.
+
+2. NORMAL        → Total end-to-end delivery pipeline delay (warehouse sort +
+                   linehaul + last-mile). By CLT, the sum of many small
+                   independent sub-delays converges to Normal.
+
+3. POISSON       → Number of failed delivery attempts per parcel per day.
+                   Models rare, discrete, independent events (nobody home,
+                   wrong address) — classic Poisson use case.
+
+4. BINOMIAL      → Whether each delivery attempt succeeds (1) or fails (0).
+                   Fixed n attempts, constant success probability p per
+                   attempt → Binomial.
+
+5. TRIANGULAR    → Rider travel time per stop (minutes) when exact traffic
+                   data is unavailable. Uses expert-estimated min/mode/max
+                   bounds — ideal for "we know the range but not the shape."
+─────────────────────────────────────────────────────────────────────────────
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
+import os  # FIX: for safe output path
+
+# Reproducibility
+np.random.seed(42)
+N = 10_000   # Monte Carlo runs
+
+#  DISTRIBUTION PARAMETERS  (tuned to Philippine last-mile logistics context)
+
+# 1. EXPONENTIAL — inter-arrival time between rider stops (minutes)
+#    λ = 1/8  →  mean gap of 8 minutes between consecutive stops
+exp_rate   = 1 / 8
+exp_sample = np.random.exponential(scale=1 / exp_rate, size=N)
+
+# 2. NORMAL — total pipeline delay: dispatch → hub → linehaul → last-mile (hours)
+#    Typical next-day window in Metro Manila
+norm_mu, norm_sigma = 18, 3
+norm_sample = np.random.normal(loc=norm_mu, scale=norm_sigma, size=N)
+
+# 3. POISSON — number of failed delivery attempts per parcel per day
+#  ~35 out of every 100 parcels fail at least once
+poisson_lambda = 0.35
+poisson_sample = np.random.poisson(lam=poisson_lambda, size=N)
+
+# 4. BINOMIAL — success/failure outcome across n=3 delivery attempts
+#    p = 0.80  (80% chance each individual attempt succeeds)
+binom_n, binom_p = 3, 0.80
+binom_sample = np.random.binomial(n=binom_n, p=binom_p, size=N)
+
+# 5. TRIANGULAR — rider travel time per stop (minutes)
+#    min=3, mode=9, max=25  (short alleys → highway → traffic jam)
+tri_low, tri_mode, tri_high = 3, 9, 25
+tri_sample = np.random.triangular(left=tri_low, mode=tri_mode,
+                                  right=tri_high, size=N)
+
+#  COMPOSITE ARRIVAL TIME ESTIMATE (convert everything to hours from midnight)
+# Base pipeline delay (Normal, already in hours) +
+# extra time from rider route: (stop gap + travel time) converted to hours +
+# penalty: each failed attempt adds ~2.5 hours (rescheduling delay)
+rider_route_extra = (exp_sample + tri_sample) / 60   # minutes → hours
+penalty           = poisson_sample * 2.5              # each failure ≈ +2.5 h
+arrival_hours     = norm_sample + rider_route_extra + penalty
+arrival_hours     = np.clip(arrival_hours, 6, 24)    # clamp to 6 AM – midnight
+
+#  PERCENTILE SUMMARY
+p10, p25, p50, p75, p90 = np.percentile(arrival_hours, [10, 25, 50, 75, 90])
+
+def hrs_to_ampm(h):
+    """Convert decimal hours (e.g. 13.5) to '1:30 PM' string."""
+    hh = int(h)
+    mm = int((h - hh) * 60)
+    suffix = "AM" if hh < 12 else "PM"
+    display = hh if hh <= 12 else hh - 12
+    display = 12 if display == 0 else display
+    return f"{display}:{mm:02d} {suffix}"
+
+#  COLOUR PALETTE  (logistics / tech dark theme)
+BG      = "#0D1117"
+PANEL   = "#161B22"
+ACCENT  = "#58A6FF"
+GREEN   = "#3FB950"
+ORANGE  = "#F78166"
+YELLOW  = "#D29922"
+PURPLE  = "#BC8CFF"
+TEAL    = "#39C5CF"
+TEXT    = "#E6EDF3"
+SUBTEXT = "#8B949E"
+
+DIST_COLORS  = [ACCENT, GREEN, ORANGE, PURPLE, TEAL]
+DIST_LABELS  = [
+    "① Exponential\nRider Inter-Arrival Time (min)",
+    "② Normal\nPipeline Delay (hours)",
+    "③ Poisson\nFailed Delivery Attempts",
+    "④ Binomial\nSuccessful Attempts out of 3",
+    "⑤ Triangular\nRider Travel Time per Stop (min)",
+]
+DIST_SAMPLES = [exp_sample, norm_sample, poisson_sample, binom_sample, tri_sample]
+DIST_BINS    = [40, 40, range(-1, 7), range(-1, 5), 40]
+
+#  FIGURE LAYOUT
+fig = plt.figure(figsize=(20, 14), facecolor=BG)
+fig.suptitle(
+    "Last-Mile Delivery Time Uncertainty  ·  Monte Carlo Simulation  (N = 10,000)",
+    fontsize=16, fontweight="bold", color=TEXT, y=0.98
+)
+
+gs = GridSpec(3, 3, figure=fig,
+              hspace=0.55, wspace=0.38,
+              left=0.06, right=0.97, top=0.93, bottom=0.06)
+
+# Helper: style an axis
+def style_ax(ax, title, xlabel, ylabel="Frequency"):
+    ax.set_facecolor(PANEL)
+    ax.set_title(title, color=TEXT, fontsize=10, fontweight="bold", pad=8)
+    ax.set_xlabel(xlabel, color=SUBTEXT, fontsize=8)
+    ax.set_ylabel(ylabel, color=SUBTEXT, fontsize=8)
+    ax.tick_params(colors=SUBTEXT, labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#30363D")
+    ax.grid(axis="y", color="#21262D", linewidth=0.8, linestyle="--")
+
+#  PLOTS 1–5 : Individual Distribution Histograms
+positions = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]
+
+for idx, (row, col) in enumerate(positions):
+    ax = fig.add_subplot(gs[row, col])
+    data  = DIST_SAMPLES[idx]
+    color = DIST_COLORS[idx]
+    bins  = DIST_BINS[idx]
+
+    if idx in (2, 3):   # Discrete → bar chart
+        vals, cnts = np.unique(data, return_counts=True)
+        ax.bar(vals, cnts / N * 100, color=color, alpha=0.85,
+               edgecolor=BG, linewidth=0.6, width=0.6)
+        ax.set_ylabel("Probability (%)", color=SUBTEXT, fontsize=8)
+    else:               # Continuous → histogram
+        ax.hist(data, bins=bins, color=color, alpha=0.80,
+                edgecolor=BG, linewidth=0.4, density=False)
+
+    style_ax(ax, DIST_LABELS[idx],
+             xlabel=["Minutes", "Hours", "# Failed Attempts",
+                     "# Successes", "Minutes"][idx])
+
+    # Annotate mean with dashed line
+    mu = np.mean(data)
+    ax.axvline(mu, color="white", linewidth=1.2, linestyle="--", alpha=0.7)
+    ax.text(mu, ax.get_ylim()[1] * 0.88, f"μ={mu:.2f}",
+            color="white", fontsize=7, ha="left", va="top",
+            bbox=dict(boxstyle="round,pad=0.2", fc=PANEL, ec=color, lw=0.8))
+
+#  PLOT 6 : Composite Arrival Time Distribution  (main deliverable)
+
+ax6 = fig.add_subplot(gs[1, 2])
+ax6.hist(arrival_hours, bins=60, density=True,
+         color=ACCENT, alpha=0.75, edgecolor=BG, linewidth=0.3)
+
+# FIX: fetch ylim AFTER plotting so slot labels don't render at y=0
+ymax6 = ax6.get_ylim()[1]
+
+slot_colors = {(6,12): "#FFD700", (12,15): "#3FB950",
+               (15,18): "#F78166", (18,24): "#BC8CFF"}
+slot_names  = {(6,12): "Morning", (12,15): "Noon",
+               (15,18): "Afternoon", (18,24): "Evening"}
+
+for (s, e), sc in slot_colors.items():
+    ax6.axvspan(s, e, alpha=0.12, color=sc, zorder=0)
+    ax6.text((s + e) / 2, ymax6 * 0.97, slot_names[(s, e)],
+             ha="center", va="top", color=sc, fontsize=7, alpha=0.9)
+
+# Percentile lines
+for pct, val, col, lbl in [
+    (10, p10, GREEN,  "P10"),
+    (50, p50, YELLOW, "P50"),
+    (90, p90, ORANGE, "P90"),
+]:
+    ax6.axvline(val, color=col, linewidth=1.5, linestyle="--", zorder=5)
+    ax6.text(val + 0.1, ymax6 * 0.60,
+             f"{lbl}\n{hrs_to_ampm(val)}", color=col,
+             fontsize=7, va="top",
+             bbox=dict(boxstyle="round,pad=0.25", fc=PANEL, ec=col, lw=0.8))
+
+style_ax(ax6, "⑥ Composite Arrival Time\n(Simulated End-to-End)",
+         "Hour of Day (24h)", "Density")
+ax6.set_xticks(range(6, 25, 2))
+ax6.set_xticklabels([hrs_to_ampm(h) for h in range(6, 25, 2)],
+                    rotation=30, ha="right", fontsize=6)
+
+
+#  PLOT 7 : Time-Slot Probability Bar Chart
+
+ax7 = fig.add_subplot(gs[2, 0])
+slots      = ["Morning\n6–12", "Noon\n12–15", "Afternoon\n15–18", "Evening\n18–24"]
+slot_probs = [
+    np.mean((arrival_hours >= 6)  & (arrival_hours < 12)) * 100,
+    np.mean((arrival_hours >= 12) & (arrival_hours < 15)) * 100,
+    np.mean((arrival_hours >= 15) & (arrival_hours < 18)) * 100,
+    np.mean((arrival_hours >= 18) & (arrival_hours < 24)) * 100,
+]
+colors7 = [YELLOW, GREEN, ORANGE, PURPLE]
+bars = ax7.bar(slots, slot_probs, color=colors7, alpha=0.85,
+               edgecolor=BG, linewidth=0.5)
+for bar, prob in zip(bars, slot_probs):
+    ax7.text(bar.get_x() + bar.get_width() / 2,
+             bar.get_height() + 0.5,
+             f"{prob:.1f}%", ha="center", va="bottom",
+             color=TEXT, fontsize=9, fontweight="bold")
+style_ax(ax7, "⑦ Arrival Time-Slot\nProbabilities", "Time Slot", "Probability (%)")
+
+
+#  PLOT 8 : Courier Comparison  (Normal PDF per courier)
+
+ax8 = fig.add_subplot(gs[2, 1])
+couriers = {
+    "J&T Express":    (17.0, 2.5, ACCENT),
+    "Shopee Express": (18.5, 3.2, GREEN),
+    "LBC":            (20.0, 3.8, ORANGE),
+    "Ninja Van":      (19.0, 2.9, PURPLE),
+}
+x_range = np.linspace(6, 24, 400)
+for name, (mu, sigma, col) in couriers.items():
+    pdf = (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x_range - mu) / sigma) ** 2)
+    ax8.plot(x_range, pdf, color=col, linewidth=2, label=name)
+    ax8.fill_between(x_range, pdf, alpha=0.12, color=col)
+
+ax8.set_xticks(range(6, 25, 3))
+ax8.set_xticklabels([hrs_to_ampm(h) for h in range(6, 25, 3)],
+                    rotation=30, ha="right", fontsize=6)
+style_ax(ax8, "⑧ Courier Arrival\nDistribution Comparison",
+         "Hour of Day", "Density")
+ax8.legend(fontsize=7, facecolor=PANEL, edgecolor="#30363D",
+           labelcolor=TEXT, loc="upper left")
+
+#  PLOT 9 : Percentile Summary Table
+
+ax9 = fig.add_subplot(gs[2, 2])
+ax9.set_facecolor(PANEL)
+ax9.axis("off")
+
+table_data = [
+    ["P10 — Earliest Likely",  hrs_to_ampm(p10), GREEN],
+    ["P25 — Early Arrival",    hrs_to_ampm(p25), TEAL],
+    ["P50 — Most Likely ★",   hrs_to_ampm(p50), YELLOW],
+    ["P75 — Running Late",     hrs_to_ampm(p75), ORANGE],
+    ["P90 — Worst Case",       hrs_to_ampm(p90), ORANGE],
+]
+ax9.set_title("⑨ Delivery Window Summary", color=TEXT,
+              fontsize=10, fontweight="bold", pad=8)
+
+for i, (label, time_str, col) in enumerate(table_data):
+    y = 0.85 - i * 0.17
+    ax9.add_patch(
+        mpatches.FancyBboxPatch(
+            (0.02, y - 0.07), 0.96, 0.14,
+            boxstyle="round,pad=0.01",
+            linewidth=1, edgecolor=col,
+            facecolor=BG, transform=ax9.transAxes, zorder=2
+        )
+    )
+    ax9.text(0.08, y, label, transform=ax9.transAxes,
+             color=SUBTEXT, fontsize=8, va="center")
+    ax9.text(0.92, y, time_str, transform=ax9.transAxes,
+             color=col, fontsize=10, fontweight="bold",
+             va="center", ha="right")
+
+safe_time = hrs_to_ampm(p10 - 0.5)
+ax9.text(0.5, 0.04,
+         f"✔ Safe to go out until:  {safe_time}",
+         transform=ax9.transAxes, ha="center", va="bottom",
+         color=GREEN, fontsize=9, fontweight="bold",
+         bbox=dict(boxstyle="round,pad=0.4", fc="#0D3A1A", ec=GREEN, lw=1.2))
+
+
+#  FOOTER
+
+fig.text(
+    0.5, 0.005,
+    "Monte Carlo DES  ·  N=10,000 simulations  ·  "
+    "Distributions: Exponential · Normal · Poisson · Binomial · Triangular",
+    ha="center", color=SUBTEXT, fontsize=8
+)
+
+
+#  SAVE  (FIX: save to current directory, not hardcoded server path)
+
+output_file = "last_mile_delivery_histograms.png"
+try:
+    plt.savefig(output_file, dpi=150, bbox_inches="tight", facecolor=BG)
+    print(f"✔ Figure saved → {os.path.abspath(output_file)}")
+except Exception as e:
+    print(f"⚠ Could not save figure: {e}")
+
+plt.show()
+
+
+#  CONSOLE SUMMARY
+
+print("\n=== DELIVERY WINDOW SUMMARY ===")
+print(f"  P10 Earliest Likely  : {hrs_to_ampm(p10)}")
+print(f"  P25 Early Arrival    : {hrs_to_ampm(p25)}")
+print(f"  P50 Most Likely      : {hrs_to_ampm(p50)}")
+print(f"  P75 Running Late     : {hrs_to_ampm(p75)}")
+print(f"  P90 Worst Case       : {hrs_to_ampm(p90)}")
+print(f"\n  ✔ Safe to go out until: {safe_time}")
+print("\nTime-Slot Probabilities:")
+for slot, prob in zip(slots, slot_probs):
+    print(f"  {slot.replace(chr(10), ' '):<22} {prob:.1f}%")
